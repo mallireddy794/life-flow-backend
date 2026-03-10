@@ -22,7 +22,7 @@ def get_db():
 
 # ---------------- EMAIL CONFIG ----------------
 EMAIL_ADDRESS = "mallireddy794@gmail.com"
-EMAIL_PASSWORD = "bcbn mdnf rnbr kdee"
+EMAIL_PASSWORD = "bcsgzjdemtalxdax"
 
 def send_otp_email(to_email, otp):
     subject = "LifeFlow Password Reset OTP"
