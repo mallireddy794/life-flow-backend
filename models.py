@@ -40,3 +40,7 @@ class ChatMessage(Base):
     receiver_id = Column(Integer, ForeignKey("users.id"))
     message = Column(String(1000))
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+
+    

@@ -199,40 +199,67 @@ def send_otp():
     otp = str(random.randint(100000, 999999))
     expiry_time = datetime.now() + timedelta(minutes=5)
 
-    cursor.execute(
-        "UPDATE users SET otp=%s, otp_expiry=%s WHERE email=%s",
-        (otp, expiry_time, email)
-    )
-    mysql.connection.commit()
-    cursor.close()
+    try:
+        cursor.execute(
+            "UPDATE users SET otp=%s, otp_expiry=%s WHERE email=%s",
+            (otp, expiry_time, email)
+        )
+        mysql.connection.commit()
+    except Exception as e:
+        mysql.connection.rollback()
+        cursor.close()
+        return jsonify({"error": "Database update failed", "details": str(e)}), 500
+    finally:
+        cursor.close()
 
     sender_email = "mallireddy794@gmail.com"
-    sender_password = "bcsgzjdemtalxdax"
+    sender_password = "iscd tkil zwvh wqjz"
 
-    msg = MIMEText(f"""
-Hello from LifeFlow,
+    body = f"""Hello from LifeFlow,
 
 Your OTP for password reset is: {otp}
 
 This OTP is valid for 5 minutes.
 
 Do not share this with anyone.
-""")
+"""
 
+    msg = MIMEText(body)
     msg["Subject"] = "LifeFlow Password Reset OTP"
     msg["From"] = sender_email
     msg["To"] = email
 
     try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
+        # Try TLS on 587
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+        server.set_debuglevel(1)
+        server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(sender_email, sender_password)
-        server.sendmail(sender_email, email, msg.as_string())
+        server.sendmail(sender_email, [email], msg.as_string())
         server.quit()
-    except Exception as e:
-        return jsonify({"error": "Email sending failed", "details": str(e)}), 500
+        return jsonify({"message": "OTP sent successfully via port 587"}), 200
 
-    return jsonify({"message": "OTP sent successfully"}), 200
+    except Exception as e_587:
+        try:
+            # Fallback to SSL on 465
+            server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+            server.set_debuglevel(1)
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, [email], msg.as_string())
+            server.quit()
+            return jsonify({"message": "OTP sent successfully via port 465"}), 200
+
+        except Exception as e_465:
+            return jsonify({
+                "error": "Email sending failed",
+                "details": {
+                    "port_587_error": str(e_587),
+                    "port_465_error": str(e_465)
+                }
+            }), 500
+
 
 
 # ================= VERIFY OTP =================
@@ -559,46 +586,6 @@ def update_hospital_profile(user_id):
 
     return jsonify({"message": "Hospital profile saved successfully"}), 200
 
-
-# ================= VIEW REQUESTS FOR HOSPITAL =================
-@app.route('/hospital/requests/<int:user_id>', methods=['GET'])
-def view_hospital_requests(user_id):
-    cursor = mysql.connection.cursor()
-
-    cursor.execute("SELECT city FROM hospitals WHERE user_id=%s", (user_id,))
-    hospital = cursor.fetchone()
-
-    if not hospital:
-        cursor.close()
-        return jsonify({"error": "Hospital not found"}), 404
-
-    city = hospital[0]
-
-    cursor.execute("""
-        SELECT id, blood_group, units_required, urgency_level, status, city, created_at
-        FROM blood_requests
-        WHERE city=%s
-        ORDER BY created_at DESC
-    """, (city,))
-
-    requests = cursor.fetchall()
-    cursor.close()
-
-    request_list = []
-    for r in requests:
-        request_list.append({
-            "request_id": r[0],
-            "blood_group": r[1],
-            "units_required": r[2],
-            "urgency_level": r[3],
-            "status": r[4],
-            "city": r[5],
-            "created_at": str(r[6]) if r[6] else None
-        })
-
-    return jsonify(request_list), 200
-
-
 # ================= CHAT =================
 def generate_chat_id(user1: int, user2: int) -> str:
     return f"{min(user1, user2)}_{max(user1, user2)}"
@@ -912,11 +899,12 @@ def root():
                 "/verify-otp",
                 "/chat/send",
                 "/patient/send_request",
-                "/donor/donations/add"
+                "/donor/donations/add",
+                "/reset-password"
+
             ],
             "PUT": [
                 "/forgot-password",
-                "/reset-password",
                 "/donor/availability/<user_id>",
                 "/donor/profile/<user_id>",
                 "/patient/profile/<user_id>",
