@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
 from MySQLdb.cursors import DictCursor
+import joblib
+import math
+
 from database import engine
 from models import Base
 
@@ -137,12 +140,22 @@ def send_otp():
         return jsonify({"error": "Email and role required"}), 400
 
     cursor = mysql.connection.cursor()
-    cursor.execute("SELECT id FROM users WHERE email=%s AND role=%s", (email, role))
+    # First try with role
+    cursor.execute("SELECT id, role FROM users WHERE email=%s AND role=%s", (email, role))
     user = cursor.fetchone()
 
     if not user:
-        cursor.close()
-        return jsonify({"error": "User not found for this role"}), 404
+        # If not found, check if the email exists at all with any role
+        cursor.execute("SELECT id, role FROM users WHERE email=%s", (email,))
+        user = cursor.fetchone()
+        if not user:
+            cursor.close()
+            return jsonify({"error": "Email not registered"}), 404
+        
+        # If email exists but role matches something else, we allow it for OTP purposes
+        actual_role = user[1]
+    else:
+        actual_role = role
 
     # Generate OTP
     otp = str(random.randint(100000, 999999))
@@ -165,6 +178,7 @@ Hello from LifeFlow,
 Your OTP for password reset is: {otp}
 
 This OTP is valid for 5 minutes.
+Account Role: {actual_role}
 
 Do not share this with anyone.
 """)
@@ -729,39 +743,41 @@ def donors_nearby():
     lng = float(lng)
 
     cur = mysql.connection.cursor()
-    cur.execute("""
-        SELECT
-          u.id,
-          u.name,
-          d.phone,
-          d.blood_group,
-          d.city,
-          u.latitude,
-          u.longitude,
-          (
-            6371 * 2 * ASIN(
-              SQRT(
-                POWER(SIN((RADIANS(u.latitude - %s)) / 2), 2) +
-                COS(RADIANS(%s)) *
-                COS(RADIANS(u.latitude)) *
-                POWER(SIN((RADIANS(u.longitude - %s)) / 2), 2)
-              )
-            )
-          ) AS distance_km
-        FROM users u
-        JOIN donors d ON d.user_id = u.id
-        WHERE u.role = 'donor'
-          AND LOWER(d.blood_group) = LOWER(%s)
-          AND d.is_available = 1
-          AND d.is_eligible = 1
-          AND u.latitude IS NOT NULL
-          AND u.longitude IS NOT NULL
-          AND u.latitude != 0
-          AND u.longitude != 0
-        HAVING distance_km <= %s
-        ORDER BY distance_km ASC
-        LIMIT 50
-    """, (lat, lat, lng, blood_group, radius))
+    if blood_group.upper() == "ALL":
+        query = """
+            SELECT
+              u.id, u.name, d.phone, d.blood_group, d.city, u.latitude, u.longitude,
+              (6371 * 2 * ASIN(SQRT(POWER(SIN((RADIANS(u.latitude - %s)) / 2), 2) + COS(RADIANS(%s)) * COS(RADIANS(u.latitude)) * POWER(SIN((RADIANS(u.longitude - %s)) / 2), 2)))) AS distance_km
+            FROM users u
+            JOIN donors d ON d.user_id = u.id
+            WHERE u.role = 'donor'
+              AND d.is_available = 1
+              AND d.is_eligible = 1
+              AND u.latitude IS NOT NULL
+              AND u.latitude != 0
+            HAVING distance_km <= %s
+            ORDER BY distance_km ASC
+            LIMIT 50
+        """
+        cur.execute(query, (lat, lat, lng, radius))
+    else:
+        query = """
+            SELECT
+              u.id, u.name, d.phone, d.blood_group, d.city, u.latitude, u.longitude,
+              (6371 * 2 * ASIN(SQRT(POWER(SIN((RADIANS(u.latitude - %s)) / 2), 2) + COS(RADIANS(%s)) * COS(RADIANS(u.latitude)) * POWER(SIN((RADIANS(u.longitude - %s)) / 2), 2)))) AS distance_km
+            FROM users u
+            JOIN donors d ON d.user_id = u.id
+            WHERE u.role = 'donor'
+              AND LOWER(d.blood_group) = LOWER(%s)
+              AND d.is_available = 1
+              AND d.is_eligible = 1
+              AND u.latitude IS NOT NULL
+              AND u.latitude != 0
+            HAVING distance_km <= %s
+            ORDER BY distance_km ASC
+            LIMIT 50
+        """
+        cur.execute(query, (lat, lat, lng, blood_group, radius))
 
     rows = cur.fetchall()
     cur.close()
@@ -989,6 +1005,28 @@ def donor_request_update():
 
     return jsonify({"message": "Request updated", "status": status}), 200
 
+
+# ================= UPDATE LOCATION =================
+@app.route('/update_location', methods=['POST'])
+def update_location():
+    data = request.get_json(force=True)
+    user_id = data.get('user_id')
+    lat = data.get('latitude')
+    lng = data.get('longitude')
+
+    if not all([user_id is not None, lat is not None, lng is not None]):
+        return jsonify({"error": "user_id, latitude, longitude required"}), 400
+
+    cursor = mysql.connection.cursor()
+    cursor.execute(
+        "UPDATE users SET latitude=%s, longitude=%s WHERE id=%s",
+        (lat, lng, user_id)
+    )
+    mysql.connection.commit()
+    cursor.close()
+
+    return jsonify({"message": "Location updated successfully"}), 200
+
 # ✅ THIS ROUTE FIXES YOUR 404
 @app.route("/", methods=["GET"])
 def root():
@@ -999,6 +1037,246 @@ def root():
             "GET": ["/chat/history?user1=1&user2=2"]
         }
     })
+
+# ================= LOAD AI MODEL =================
+try:
+    model = joblib.load("lifeflow_best_donor_model (1).pkl")
+except Exception as e:
+    print(f"Failed to load model: {e}")
+    model = None
+
+# ================= BLOOD COMPATIBILITY =================
+COMPATIBLE = {
+    "A+": ["A+", "A-", "O+", "O-"],
+    "A-": ["A-", "O-"],
+    "B+": ["B+", "B-", "O+", "O-"],
+    "B-": ["B-", "O-"],
+    "AB+": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"],
+    "AB-": ["A-", "B-", "AB-", "O-"],
+    "O+": ["O+", "O-"],
+    "O-": ["O-"]
+}
+
+# ================= DISTANCE FUNCTION =================
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+# ================= BLOOD MATCH SCORE =================
+def get_blood_match_score(patient_bg: str, donor_bg: str) -> float:
+    patient_bg = (patient_bg or "").strip().upper()
+    donor_bg = (donor_bg or "").strip().upper()
+
+    if donor_bg == patient_bg:
+        return 1.0
+    if donor_bg in COMPATIBLE.get(patient_bg, []):
+        return 0.7
+    return 0.0
+
+# ================= SAFE VALUE HELPERS =================
+def to_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+def to_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+# ================= AI SCORE FUNCTION =================
+def predict_ai_score(donor_features: dict) -> float:
+    if not model:
+        return 0.0
+    feature_row = [[
+        donor_features["blood_match_score"],
+        donor_features["distance_km"],
+        donor_features["is_available"],
+        donor_features["is_eligible"],
+        donor_features["days_since_last_donation"],
+        donor_features["urgency_level"],
+        donor_features["past_acceptance_rate"],
+        donor_features["response_time_avg"],
+        donor_features["donor_active_status"]
+    ]]
+    score = model.predict_proba(feature_row)[0][1]
+    return round(float(score), 4)
+
+# ================= GET NEARBY DONORS =================
+def fetch_all_donors():
+    """
+    Gets donor data from users + donors table.
+    You can add extra fields later if available in your DB.
+    """
+    cursor = mysql.connection.cursor(DictCursor)
+    query = """
+        SELECT
+            u.id,
+            u.name,
+            u.email,
+            u.latitude,
+            u.longitude,
+            d.phone,
+            d.blood_group,
+            d.age,
+            d.city,
+            d.is_available,
+            d.is_eligible,
+            d.last_status_update,
+            d.past_acceptance_rate,
+            d.response_time_avg,
+            d.donor_active_status,
+            d.last_donation_date
+        FROM users u
+        INNER JOIN donors d ON u.id = d.user_id
+        WHERE u.role = 'donor'
+          AND u.latitude IS NOT NULL
+          AND u.longitude IS NOT NULL
+    """
+    cursor.execute(query)
+    donors = cursor.fetchall()
+    cursor.close()
+    return donors
+
+# ================= MAIN API =================
+@app.route('/emergency-donors', methods=['POST'])
+def emergency_donors():
+    try:
+        data = request.get_json(force=True)
+
+        patient_id = data.get("patient_id")
+        patient_blood_group = str(data.get("blood_group", "")).strip().upper()
+        patient_lat = to_float(data.get("lat"))
+        patient_lng = to_float(data.get("lng"))
+        units_required = to_int(data.get("units_required", 1), 1)
+        radius_km = to_float(data.get("radius_km", 5), 5.0)
+
+        print(f"DEBUG: Emergency Search - BG: {patient_blood_group}, Lat: {patient_lat}, Lng: {patient_lng}, Radius: {radius_km}")
+
+        if not patient_blood_group or (patient_lat == 0.0 and patient_lng == 0.0):
+            return jsonify({
+                "error": "blood_group, lat, lng are required"
+            }), 400
+
+        all_donors = fetch_all_donors()
+        ranked_donors = []
+
+        for donor in all_donors:
+            donor_lat = to_float(donor.get("latitude"))
+            donor_lng = to_float(donor.get("longitude"))
+
+            if donor_lat == 0.0 and donor_lng == 0.0:
+                continue
+
+            distance_km = haversine_km(patient_lat, patient_lng, donor_lat, donor_lng)
+
+            if distance_km > radius_km:
+                continue
+
+            donor_blood_group = str(donor.get("blood_group", "")).strip().upper()
+            
+            if patient_blood_group == "ALL":
+                blood_match_score = 1.0
+            else:
+                blood_match_score = get_blood_match_score(patient_blood_group, donor_blood_group)
+
+            if blood_match_score == 0.0:
+                continue
+
+            is_available = to_int(donor.get("is_available"), 0)
+            is_eligible = to_int(donor.get("is_eligible"), 0)
+
+            if is_available != 1 or is_eligible != 1:
+                continue
+
+            # --- REAL AI VALUES FROM DB ---
+            # Calculate days since last donation
+            last_don = donor.get("last_donation_date")
+            if last_don:
+                # If it's a string, convert to date. Usually MySQLdb returns date objects.
+                if isinstance(last_don, str):
+                    last_don = datetime.strptime(last_don, "%Y-%m-%d").date()
+                days_since_last_donation = (datetime.now().date() - last_don).days
+            else:
+                days_since_last_donation = 180 # Default to 6 months if never donated
+
+            # Acceptance Rate (0.0 to 1.0)
+            past_acceptance_rate = to_float(donor.get("past_acceptance_rate"), 0.80)
+            # Response Time (minutes)
+            response_time_avg = to_int(donor.get("response_time_avg"), 5)
+            # Active status
+            donor_active_status = to_int(donor.get("donor_active_status"), 1)
+            
+            urgency_level = 2  # emergency mode
+
+            donor_features = {
+                "blood_match_score": blood_match_score,
+                "distance_km": round(distance_km, 2),
+                "is_available": is_available,
+                "is_eligible": is_eligible,
+                "days_since_last_donation": days_since_last_donation,
+                "urgency_level": urgency_level,
+                "past_acceptance_rate": past_acceptance_rate,
+                "response_time_avg": response_time_avg,
+                "donor_active_status": donor_active_status
+            }
+
+            ai_score = predict_ai_score(donor_features)
+
+            ranked_donors.append({
+                "donor_id": donor["id"],
+                "name": donor.get("name"),
+                "email": donor.get("email"),
+                "phone": donor.get("phone"),
+                "blood_group": donor_blood_group,
+                "age": donor.get("age"),
+                "city": donor.get("city"),
+                "latitude": donor_lat,
+                "longitude": donor_lng,
+                "distance_km": round(distance_km, 2),
+                "blood_match_score": blood_match_score,
+                "is_available": is_available,
+                "is_eligible": is_eligible,
+                "days_since_last_donation": days_since_last_donation,
+                "past_acceptance_rate": past_acceptance_rate,
+                "response_time_avg": response_time_avg,
+                "donor_active_status": donor_active_status,
+                "urgency_level": urgency_level,
+                "ai_score": ai_score
+            })
+
+        ranked_donors.sort(key=lambda x: (x["ai_score"], -x["distance_km"]), reverse=True)
+
+        best_donor = ranked_donors[0] if ranked_donors else None
+
+        return jsonify({
+            "message": "Emergency donor search completed",
+            "patient_id": patient_id,
+            "patient_blood_group": patient_blood_group,
+            "units_required": units_required,
+            "radius_km": radius_km,
+            "best_donor": best_donor,
+            "nearby_donors": ranked_donors,
+            "total_donors_found": len(ranked_donors)
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to fetch emergency donors",
+            "details": str(e)
+        }), 500
 
 # ================= RUN =================
 if __name__ == "__main__":
