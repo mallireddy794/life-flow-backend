@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+﻿from flask import Flask, request, jsonify
 from flask_mysqldb import MySQL
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,6 +12,7 @@ import math
 
 from database import engine
 from models import Base
+import re
 
 Base.metadata.create_all(bind=engine)
 # SQLAlchemy imports
@@ -227,6 +228,71 @@ def verify_otp():
 
     cursor.close()
     return jsonify({"message": "OTP verified successfully"})
+
+
+# ================= SENTIMENT ANALYSIS =================
+def analyze_sentiment(text):
+    if not text: return 0.5
+    text = text.lower()
+    positive_words = ['good', 'great', 'excellent', 'helpful', 'kind', 'polite', 'fast', 'smooth', 'saved', 'thanks', 'wonderful']
+    negative_words = ['bad', 'slow', 'rude', 'late', 'painful', 'poor', 'unprofessional', 'worst', 'angry', 'terrible']
+    
+    pos_count = sum(1 for word in positive_words if word in text)
+    neg_count = sum(1 for word in negative_words if word in text)
+    
+    total = pos_count + neg_count
+    if total == 0: return 0.5
+    
+    score = pos_count / total
+    return round(score, 2)
+
+
+# ================= RATE DONOR =================
+@app.route('/donor/rate', methods=['POST'])
+def rate_donor():
+    data = request.get_json(force=True)
+    donor_id = data.get("donor_id")
+    patient_id = data.get("patient_id")
+    rating = data.get("rating")
+    review_text = data.get("review_text", "")
+
+    if not all([donor_id, patient_id, rating]):
+        return jsonify({"error": "Missing donor_id, patient_id or rating"}), 400
+
+    sentiment_score = analyze_sentiment(review_text)
+
+    cur = mysql.connection.cursor()
+    try:
+        # 1. Insert review
+        cur.execute("""
+            INSERT INTO donor_reviews (donor_id, patient_id, rating, review_text, sentiment_score)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (donor_id, patient_id, rating, review_text, sentiment_score))
+
+        # 2. Update donor aggregates
+        cur.execute("""
+            SELECT AVG(rating), AVG(sentiment_score), COUNT(*) 
+            FROM donor_reviews WHERE donor_id = %s
+        """, (donor_id,))
+        avg_r, avg_s, count = cur.fetchone()
+
+        cur.execute("""
+            UPDATE donors 
+            SET avg_rating = %s, sentiment_score = %s, total_reviews = %s
+            WHERE user_id = %s
+        """, (avg_r, avg_s, count, donor_id))
+
+        mysql.connection.commit()
+        cur.close()
+        return jsonify({
+            "message": "Rating submitted",
+            "sentiment_score": sentiment_score,
+            "new_avg_rating": float(avg_r)
+        }), 201
+    except Exception as e:
+        mysql.connection.rollback()
+        if cur: cur.close()
+        return jsonify({"error": str(e)}), 500
 
 
 # ================= RESET PASSWORD =================
@@ -1138,7 +1204,10 @@ def fetch_all_donors():
             d.past_acceptance_rate,
             d.response_time_avg,
             d.donor_active_status,
-            d.last_donation_date
+            d.last_donation_date,
+            d.avg_rating,
+            d.sentiment_score,
+            d.total_reviews
         FROM users u
         INNER JOIN donors d ON u.id = d.user_id
         WHERE u.role = 'donor'
@@ -1254,7 +1323,10 @@ def emergency_donors():
                 "response_time_avg": response_time_avg,
                 "donor_active_status": donor_active_status,
                 "urgency_level": urgency_level,
-                "ai_score": ai_score
+                "ai_score": ai_score,
+                "avg_rating": to_float(donor.get("avg_rating"), 0.0),
+                "sentiment_score": to_float(donor.get("sentiment_score"), 0.0),
+                "total_reviews": to_int(donor.get("total_reviews"), 0)
             })
 
         ranked_donors.sort(key=lambda x: (x["ai_score"], -x["distance_km"]), reverse=True)
@@ -1280,4 +1352,4 @@ def emergency_donors():
 
 # ================= RUN =================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=8006, debug=True)
